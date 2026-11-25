@@ -55,6 +55,7 @@ pub enum View {
     Planned,
     List(u64),
     Search,
+    Pomodoro,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,12 +65,28 @@ enum Phase {
     Longue,
 }
 
+/// Un seul minuteur : onglet Pomodoro, barre de titre et zone de notification.
 struct Pomo {
-    task: u64,
+    /// None = session libre (temps compté à part)
+    task: Option<u64>,
     phase: Phase,
-    start: Instant,
+    /// durée de la phase
+    len: Duration,
+    /// fin prévue, minuteur en marche
     end: Instant,
+    /// temps restant figé pendant une pause
+    paused: Option<Duration>,
+    /// cycles de travail terminés
     cycles: u32,
+}
+
+impl Pomo {
+    fn left(&self) -> Duration {
+        self.paused.unwrap_or_else(|| self.end.saturating_duration_since(Instant::now()))
+    }
+    fn running(&self) -> bool {
+        self.paused.is_none()
+    }
 }
 
 #[derive(Default)]
@@ -122,6 +139,8 @@ pub struct App {
     show_done: bool,
     suggest_open: bool,
     pomo: Option<Pomo>,
+    /// tâche choisie dans l'onglet Pomodoro (None = session libre)
+    pomo_task: Option<u64>,
     last_done: Option<(u64, Instant)>,
     deleted: Option<Task>,
     rename: Option<(u64, String)>,
@@ -180,6 +199,7 @@ impl App {
             show_done: false,
             suggest_open: false,
             pomo: None,
+            pomo_task: None,
             last_done: None,
             deleted: None,
             rename: None,
@@ -277,9 +297,9 @@ impl App {
         }
         let midnight = (self.today + CDur::days(1)).and_hms_opt(0, 0, 1).unwrap_or(now);
         at((midnight - now).to_std().unwrap_or_default());
-        if let Some(p) = &self.pomo {
+        if let Some(p) = self.pomo.as_ref().filter(|p| p.running()) {
             if Instant::now() >= p.end {
-                self.pomo_next();
+                self.pomo_next(false);
                 changed = true;
             }
             at(Duration::from_millis(1000 - (now.nanosecond() / 1_000_000).min(999) as u64));
@@ -308,71 +328,101 @@ impl App {
         .clamp(1, 240) as u64
     }
 
-    fn pomo_start(&mut self, task: u64) {
-        self.pomo_stop();
-        let n = Instant::now();
-        self.pomo = Some(Pomo { task, phase: Phase::Travail, start: n, end: n + Duration::from_secs(self.minutes(Phase::Travail) * 60), cycles: 0 });
+    fn phase_len(&self, p: Phase) -> Duration {
+        Duration::from_secs(self.minutes(p) * 60)
     }
 
-    /// Arrêt : le temps de travail entamé est compté sur la tâche.
+    fn pomo_start(&mut self, task: Option<u64>) {
+        self.pomo_stop();
+        let len = self.phase_len(Phase::Travail);
+        self.pomo = Some(Pomo { task, phase: Phase::Travail, len, end: Instant::now() + len, paused: None, cycles: 0 });
+    }
+
+    /// Temps de travail compté sur la tâche, ou à part pour une session libre.
+    fn credit(&mut self, task: Option<u64>, secs: u64) {
+        if secs == 0 {
+            return;
+        }
+        match task.and_then(|id| self.data.get_mut(id)) {
+            Some(t) => t.spent += secs,
+            None => self.data.free_spent += secs,
+        }
+        self.touch();
+    }
+
+    fn worked(p: &Pomo) -> u64 {
+        if p.phase == Phase::Travail { p.len.saturating_sub(p.left()).as_secs() } else { 0 }
+    }
+
+    /// Arrêt (réinitialiser) : le temps de travail entamé est compté.
     fn pomo_stop(&mut self) {
         if let Some(p) = self.pomo.take() {
-            if p.phase == Phase::Travail {
-                let secs = p.start.elapsed().as_secs().min(p.end.saturating_duration_since(p.start).as_secs());
-                if let Some(t) = self.data.get_mut(p.task) {
-                    t.spent += secs;
-                }
-                self.touch();
-            }
+            self.credit(p.task, Self::worked(&p));
         }
     }
 
-    fn pomo_next(&mut self) {
+    /// Phase suivante : fin normale, ou « Passer » (`skip`, sans son).
+    fn pomo_next(&mut self, skip: bool) {
         let Some(mut p) = self.pomo.take() else { return };
+        self.credit(p.task, Self::worked(&p));
         if p.phase == Phase::Travail {
-            let secs = p.end.saturating_duration_since(p.start).as_secs();
-            if let Some(t) = self.data.get_mut(p.task) {
-                t.spent += secs;
-            }
-            self.touch();
             p.cycles += 1;
             p.phase = if p.cycles % self.data.settings.pomo_cycles.max(1) == 0 { Phase::Longue } else { Phase::Pause };
         } else {
             p.phase = Phase::Travail;
         }
-        let n = Instant::now();
-        p.start = n;
-        p.end = n + Duration::from_secs(self.minutes(p.phase) * 60);
+        p.len = self.phase_len(p.phase);
+        if p.paused.is_some() {
+            p.paused = Some(p.len);
+        }
+        p.end = Instant::now() + p.len;
         self.pomo = Some(p);
-        self.ding(Sound::Pomodoro);
+        if !skip {
+            self.ding(Sound::Pomodoro);
+        }
+    }
+
+    /// Démarrer / Pause / Reprendre.
+    fn pomo_play_pause(&mut self) {
+        match self.pomo.as_mut() {
+            None => {
+                let t = self.pomo_task.filter(|id| self.data.get(*id).is_some());
+                self.pomo_start(t);
+            }
+            Some(p) => match p.paused.take() {
+                Some(left) => p.end = Instant::now() + left,
+                None => p.paused = Some(p.end.saturating_duration_since(Instant::now())),
+            },
+        }
+    }
+
+    fn phase_name(p: Phase) -> &'static str {
+        match p {
+            Phase::Travail => "Travail",
+            Phase::Pause => "Pause",
+            Phase::Longue => "Longue pause",
+        }
     }
 
     fn pomo_label(&self) -> Option<String> {
         let p = self.pomo.as_ref()?;
-        let left = p.end.saturating_duration_since(Instant::now()).as_secs();
-        let what = match p.phase {
-            Phase::Travail => "travail",
-            Phase::Pause => "pause",
-            Phase::Longue => "longue pause",
-        };
-        Some(format!("{:02}:{:02} {what}", left / 60, left % 60))
+        let left = p.left().as_secs();
+        let pause = if p.running() { "" } else { " (en pause)" };
+        Some(format!("{:02}:{:02} {}{pause}", left / 60, left % 60, Self::phase_name(p.phase).to_lowercase()))
     }
 
+    /// Ctrl+P et menu de l'icône : démarre (tâche sélectionnée, sinon session libre) ou arrête.
     pub fn pomodoro_toggle(&mut self) {
         if self.pomo.is_some() {
             self.pomo_stop();
             self.toasts.info("Pomodoro arrêté");
             return;
         }
-        let today = self.today;
-        let id = self.sel.or_else(|| self.data.tasks.iter().find(|t| !t.is_done() && t.in_my_day(today)).map(|t| t.id));
-        match id {
-            Some(id) => {
-                self.pomo_start(id);
-                self.toasts.info(format!("Pomodoro : {} min sur « {} »", self.minutes(Phase::Travail), self.data.get(id).map_or("", |t| t.title.as_str())));
-            }
-            None => self.toasts.info("Choisis d'abord une tâche pour le pomodoro"),
-        }
+        let id = if self.view == View::Pomodoro { self.pomo_task } else { self.sel };
+        self.pomo_task = id;
+        self.pomo_start(id);
+        let sur = id.and_then(|i| self.data.get(i)).map_or("session libre".to_string(), |t| format!("« {} »", t.title));
+        self.toasts.info(format!("Pomodoro : {} min, {sur}", self.minutes(Phase::Travail)));
     }
 
     // ------------------------------------------------------------------ entrées externes
@@ -389,6 +439,15 @@ impl App {
             }
             Ok("suggestions") => self.suggest_open = true,
             Ok("planifie") => self.view = View::Planned,
+            Ok("pomodoro") => {
+                self.view = View::Pomodoro;
+                self.pomo_task = self.data.tasks.iter().find(|t| t.sequential).map(|t| t.id);
+                self.pomo_start(self.pomo_task);
+                if let Some(x) = self.pomo.as_mut() {
+                    x.cycles = 1;
+                    x.paused = Some(x.len * 3 / 5);
+                }
+            }
             _ => {}
         }
     }
@@ -506,17 +565,18 @@ impl App {
                     if self.sel == Some(id) {
                         self.sel = None;
                     }
-                    if self.pomo.as_ref().is_some_and(|p| p.task == id) {
-                        self.pomo = None;
+                    if let Some(p) = self.pomo.as_mut().filter(|p| p.task == Some(id)) {
+                        p.task = None;
                     }
                     self.touch();
                 }
             }
             Act::Pomo(id) => {
-                if self.pomo.as_ref().is_some_and(|p| p.task == id) {
+                if self.pomo.as_ref().is_some_and(|p| p.task == Some(id)) {
                     self.pomo_stop();
                 } else {
-                    self.pomo_start(id);
+                    self.pomo_task = Some(id);
+                    self.pomo_start(Some(id));
                 }
             }
             Act::MoveTo(id, list) => {
@@ -582,6 +642,14 @@ impl App {
                 }
             }
             View::List(l) => return self.apply(Act::MoveTo(id, l)),
+            View::Pomodoro => {
+                // déposer une tâche sur Pomodoro : le minuteur travaille pour elle
+                self.pomo_task = Some(id);
+                if let Some(p) = self.pomo.as_mut() {
+                    p.task = Some(id);
+                }
+                return;
+            }
             View::Search => {}
         }
         if let Some(t) = self.data.get_mut(id) {
@@ -624,7 +692,7 @@ impl App {
             View::Important => t.important,
             View::Planned => t.due.is_some() || t.remind.is_some(),
             View::List(id) => t.list == id,
-            View::Search => false,
+            View::Search | View::Pomodoro => false,
         }
     }
 
@@ -684,6 +752,7 @@ impl App {
             View::Planned => "Planifié".into(),
             View::List(id) => self.data.list_name(id).to_string(),
             View::Search => "Recherche".into(),
+            View::Pomodoro => "Pomodoro".into(),
         }
     }
 
@@ -705,9 +774,13 @@ impl App {
             Command::new("down", "Descendre la tâche").group("Tâches").keys("Alt+↓").icon(Icon::ArrowDown).enabled(sel),
             Command::new("nav", "Tâche précédente / suivante").group("Tâches").keys("↑ ↓"),
             Command::new("pomodoro", if self.pomo.is_some() { "Arrêter le pomodoro" } else { "Démarrer un pomodoro" }).group("Pomodoro").keys("Ctrl+P").icon(Icon::Clock),
+            Command::new("v:pomo", "Onglet Pomodoro").group("Pomodoro").keys("Ctrl+0").icon(Icon::Clock),
+            Command::new("pomo-play", "Pomodoro : démarrer / pause").group("Pomodoro").keys("Espace (onglet)"),
+            Command::new("pomo-skip", "Pomodoro : passer la phase").group("Pomodoro").enabled(self.pomo.is_some()),
+            Command::new("pomo-reset", "Pomodoro : réinitialiser").group("Pomodoro").enabled(self.pomo.is_some()),
             Command::new("v:myday", "Ma journée").group("Affichage").keys("Ctrl+1").icon(Icon::Sun),
             Command::new("v:important", "Important").group("Affichage").keys("Ctrl+2").icon(Icon::Star),
-            Command::new("v:planned", "Planifié").group("Affichage").keys("Ctrl+3").icon(Icon::Clock),
+            Command::new("v:planned", "Planifié").group("Affichage").keys("Ctrl+3").icon(Icon::Grid),
             Command::new("v:tasks", "Tâches").group("Affichage").keys("Ctrl+4").icon(Icon::Home),
             Command::new("lists", "Listes perso").group("Affichage").keys("Ctrl+5…9"),
             Command::new("search", "Rechercher").group("Affichage").keys("Ctrl+F").icon(Icon::Search),
@@ -738,6 +811,7 @@ impl App {
         let sel = self.sel;
         match id {
             "new" => self.focus_new = true,
+            "toggle" if self.view == View::Pomodoro => self.pomo_play_pause(),
             "toggle" => sel.into_iter().for_each(|i| self.apply(Act::Toggle(i))),
             "back" => sel.into_iter().for_each(|i| self.apply(Act::Back(i))),
             "myday" => sel.into_iter().for_each(|i| self.apply(Act::MyDay(i))),
@@ -748,6 +822,10 @@ impl App {
             "undo" => self.undo(),
             "up" | "down" => self.nudge(id == "up"),
             "pomodoro" => self.pomodoro_toggle(),
+            "v:pomo" => self.set_view(View::Pomodoro),
+            "pomo-play" => self.pomo_play_pause(),
+            "pomo-skip" => self.pomo_next(true),
+            "pomo-reset" => self.pomo_stop(),
             "v:myday" => self.set_view(View::MyDay),
             "v:important" => self.set_view(View::Important),
             "v:planned" => self.set_view(View::Planned),
@@ -852,6 +930,7 @@ impl App {
         }
         if let Some(d) = socle::keys::consume_ctrl_digit(ctx) {
             match d {
+                0 => self.set_view(View::Pomodoro),
                 1 => self.set_view(View::MyDay),
                 2 => self.set_view(View::Important),
                 3 => self.set_view(View::Planned),
@@ -979,7 +1058,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("Ctrl+K commandes · F1 aide").size(theme::taille::ETAT).color(pal.muted));
                     if let Some(l) = self.pomo_label() {
-                        let task = self.pomo.as_ref().and_then(|p| self.data.get(p.task)).map_or(String::new(), |t| t.title.clone());
+                        let task = self.pomo.as_ref().and_then(|p| p.task).and_then(|id| self.data.get(id)).map_or("session libre".to_string(), |t| t.title.clone());
                         ui.label(RichText::new(format!("{l} · {task}  ")).size(theme::taille::ETAT).color(pal.live));
                     }
                 });
@@ -1063,7 +1142,7 @@ impl App {
             self.set_view(View::Search);
         }
         ui.add_space(8.0);
-        let smart = [(View::MyDay, Icon::Sun, "Ma journée"), (View::Important, Icon::Star, "Important"), (View::Planned, Icon::Clock, "Planifié"), (View::List(DEFAULT_LIST), Icon::Home, "Tâches")];
+        let smart = [(View::MyDay, Icon::Sun, "Ma journée"), (View::Important, Icon::Star, "Important"), (View::Planned, Icon::Grid, "Planifié"), (View::List(DEFAULT_LIST), Icon::Home, "Tâches")];
         for (v, icon, label) in smart {
             let label = if let View::List(id) = v { self.data.list_name(id).to_string() } else { label.to_string() };
             let r = self.side_item(ui, icon, &label, self.count(v), self.view == v, Sense::click());
@@ -1075,6 +1154,21 @@ impl App {
             }
             if v == View::List(DEFAULT_LIST) {
                 self.list_menu(&r, DEFAULT_LIST);
+            }
+        }
+        {
+            let v = View::Pomodoro;
+            let r = self.side_item(ui, Icon::Clock, "Pomodoro", 0, self.view == v, Sense::click());
+            if r.clicked() {
+                self.set_view(v);
+            }
+            if let Some(d) = r.dnd_release_payload::<DragTask>() {
+                self.drop_on(v, d.0);
+            }
+            if let Some(p) = &self.pomo {
+                let left = p.left().as_secs();
+                let col = if !p.running() { self.pal.muted } else if p.phase == Phase::Travail { self.pal.accent } else { self.pal.add };
+                socle::ui::paint_text_right(ui, r.rect, r.rect.right() - 10.0, &format!("{:02}:{:02}", left / 60, left % 60), FontId::monospace(theme::taille::META), col);
             }
         }
         ui.add_space(4.0);
@@ -1195,15 +1289,19 @@ impl App {
     }
 
     fn main(&mut self, ui: &mut Ui, acts: &mut Vec<Act>, n: NaiveDateTime) {
+        if self.view == View::Pomodoro {
+            return self.pomo_view(ui);
+        }
         let p = self.pal.clone();
         // en-tête
         ui.horizontal(|ui| {
             let icon = match self.view {
                 View::MyDay => Icon::Sun,
                 View::Important => Icon::Star,
-                View::Planned => Icon::Clock,
+                View::Planned => Icon::Grid,
                 View::List(id) => self.data.list(id).map_or(Icon::ListView, |l| if id == DEFAULT_LIST { Icon::Home } else { list_icon(&l.icon) }),
                 View::Search => Icon::Search,
+                View::Pomodoro => Icon::Clock,
             };
             let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
             icons::paint(ui.painter(), r, icon, p.accent);
@@ -1490,7 +1588,7 @@ impl App {
             right = ur.left() - 6.0;
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
-        if self.pomo.as_ref().is_some_and(|x| x.task == id) {
+        if self.pomo.as_ref().is_some_and(|x| x.task == Some(id)) {
             let pr = Rect::from_center_size(pos2(right - 10.0, card.center().y), vec2(16.0, 16.0));
             icons::paint(ui.painter(), pr, Icon::Clock, p.live);
             right = pr.left() - 6.0;
@@ -1556,7 +1654,7 @@ impl App {
                 acts.push(Act::Star(id));
                 ui.close();
             }
-            if ui.button(if self.pomo.as_ref().is_some_and(|x| x.task == id) { "Arrêter le pomodoro" } else { "Démarrer un pomodoro" }).clicked() {
+            if ui.button(if self.pomo.as_ref().is_some_and(|x| x.task == Some(id)) { "Arrêter le pomodoro" } else { "Démarrer un pomodoro" }).clicked() {
                 acts.push(Act::Pomo(id));
                 ui.close();
             }
@@ -1574,6 +1672,111 @@ impl App {
                 ui.close();
             }
         });
+    }
+
+    /// Onglet Pomodoro : temps restant en grand dans un anneau qui se remplit.
+    fn pomo_view(&mut self, ui: &mut Ui) {
+        let p = self.pal.clone();
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+            icons::paint(ui.painter(), r, Icon::Clock, p.accent);
+            ui.label(RichText::new("Pomodoro").size(24.0).color(p.text));
+        });
+        let every = self.data.settings.pomo_cycles.max(1);
+        let (phase, left, len, cycles, running, active) = match &self.pomo {
+            Some(x) => (x.phase, x.left(), x.len, x.cycles, x.running(), true),
+            None => (Phase::Travail, self.phase_len(Phase::Travail), self.phase_len(Phase::Travail), 0, false, false),
+        };
+        let rank = if phase == Phase::Travail { cycles % every + 1 } else { (cycles.max(1) - 1) % every + 1 };
+        let color = if phase == Phase::Travail { p.accent } else { theme::blend(p.add, p.bg, 0.25) };
+        let avail = ui.available_size();
+        let d = (avail.y - 230.0).min(avail.x - 40.0).clamp(160.0, 380.0);
+        ui.add_space(((avail.y - d - 210.0) / 2.0).clamp(8.0, 60.0));
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d), Sense::hover());
+        let c = rect.center();
+        let rad = d / 2.0 - 10.0;
+        let paint = ui.painter();
+        paint.circle_stroke(c, rad, Stroke::new(12.0, theme::blend(p.border, p.bg, 0.3)));
+        let frac = 1.0 - left.as_secs_f32() / len.as_secs_f32().max(1.0);
+        if frac > 0.0005 {
+            let k = (180.0 * frac).ceil().max(2.0) as usize;
+            let pts: Vec<egui::Pos2> = (0..=k)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac * i as f32 / k as f32;
+                    c + vec2(a.cos(), a.sin()) * rad
+                })
+                .collect();
+            let (a0, a1) = (pts[0], pts[k]);
+            paint.add(egui::Shape::line(pts, Stroke::new(12.0, color)));
+            // bouts arrondis
+            paint.circle_filled(a0, 6.0, color);
+            paint.circle_filled(a1, 6.0, color);
+        }
+        let secs = left.as_secs() + u64::from(running && left.subsec_millis() > 0);
+        let big = (d * 0.22).clamp(36.0, 84.0);
+        paint.text(c - vec2(0.0, big * 0.15), egui::Align2::CENTER_CENTER, format!("{:02}:{:02}", secs / 60, secs % 60), FontId::proportional(big), p.text);
+        let sub = if phase == Phase::Travail { format!("Travail {rank}/{every}") } else { format!("{} · {rank}/{every}", Self::phase_name(phase)) };
+        paint.text(c + vec2(0.0, big * 0.55), egui::Align2::CENTER_CENTER, sub, FontId::proportional(theme::taille::TITRE + 1.0), color);
+        if active && !running {
+            paint.text(c + vec2(0.0, big * 0.55 + 24.0), egui::Align2::CENTER_CENTER, "en pause", FontId::proportional(theme::taille::META), p.muted);
+        }
+        // animation fluide seulement pendant que le minuteur tourne (CPU ~0 en pause)
+        if running {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+        ui.add_space(18.0);
+        let bw = 150.0;
+        let total = bw * 3.0 + 16.0;
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+            let (icon, label) = match (active, running) {
+                (false, _) => (Icon::Play, "Démarrer"),
+                (true, true) => (Icon::Pause, "Pause"),
+                (true, false) => (Icon::Play, "Reprendre"),
+            };
+            if icons::wide(ui, icon, label, "", bw, Some((color, p.on_accent)), &p).clicked() {
+                self.pomo_play_pause();
+            }
+            ui.add_enabled_ui(active, |ui| {
+                if icons::wide(ui, Icon::Next, "Passer", "", bw, None, &p).on_hover_text("Phase suivante (le travail fait est compté)").clicked() {
+                    self.pomo_next(true);
+                }
+                if icons::wide(ui, Icon::Reset, "Réinitialiser", "", bw, None, &p).on_hover_text("Arrête et revient au début (le travail fait est compté)").clicked() {
+                    self.pomo_stop();
+                }
+            });
+        });
+        ui.add_space(16.0);
+        // tâche attachée (facultative)
+        let today = self.today;
+        let mut cands: Vec<(u64, String, bool)> = self.data.tasks.iter().filter(|t| !t.is_done()).map(|t| (t.id, t.title.clone(), t.in_my_day(today))).collect();
+        cands.sort_by_key(|c| !c.2);
+        let cur = self.pomo.as_ref().map_or(self.pomo_task, |x| x.task);
+        let cur_name = cur.and_then(|i| self.data.get(i)).map_or("Session libre".to_string(), |t| t.title.clone());
+        let mut pick = cur;
+        ui.horizontal(|ui| {
+            let w = 320.0;
+            ui.add_space(((ui.available_width() - w - 60.0) / 2.0).max(0.0));
+            ui.label(RichText::new("Tâche").color(p.muted));
+            egui::ComboBox::from_id_salt("pomo-tache").selected_text(cur_name).width(w).show_ui(ui, |ui| {
+                ui.selectable_value(&mut pick, None, "Session libre");
+                for (id, title, _) in &cands {
+                    ui.selectable_value(&mut pick, Some(*id), title);
+                }
+            });
+        });
+        if pick != cur {
+            self.pomo_task = pick;
+            if let Some(x) = self.pomo.as_mut() {
+                x.task = pick;
+            }
+        }
+        ui.add_space(6.0);
+        let mut stats = format!("Sessions libres : {}", fmt_spent(self.data.free_spent));
+        if let Some(t) = pick.and_then(|i| self.data.get(i)) {
+            stats = format!("Sur « {} » : {}   ·   {stats}", t.title, fmt_spent(t.spent));
+        }
+        ui.vertical_centered(|ui| ui.label(RichText::new(stats).size(theme::taille::META).color(p.muted)));
     }
 
     fn suggestions_ui(&mut self, ui: &mut Ui, acts: &mut Vec<Act>, n: NaiveDateTime) {
@@ -1885,7 +2088,7 @@ impl App {
         // pomodoro
         ui.label(RichText::new("POMODORO").size(theme::taille::ENTETE).color(p.muted));
         {
-            let running = self.pomo.as_ref().is_some_and(|x| x.task == id);
+            let running = self.pomo.as_ref().is_some_and(|x| x.task == Some(id));
             let label = if running { format!("Arrêter  ({})", self.pomo_label().unwrap_or_default()) } else { format!("Démarrer  ({} min)", self.minutes(Phase::Travail)) };
             if icons::wide(ui, Icon::Clock, &label, "Ctrl+P", ui.available_width(), if running { Some((p.live, p.on_accent)) } else { None }, &p).clicked() {
                 acts.push(Act::Pomo(id));
@@ -2097,21 +2300,34 @@ mod tests {
     fn pomodoro_compte_le_temps() {
         let mut a = app("pomo");
         let id = a.add_parsed("écrire", View::MyDay).unwrap();
-        a.pomo_start(id);
+        a.pomo_start(Some(id));
         a.pomo.as_mut().unwrap().end = Instant::now();
-        a.pomo.as_mut().unwrap().start = Instant::now() - Duration::from_secs(25 * 60);
-        a.pomo_next();
+        a.pomo_next(false);
         assert_eq!(a.data.get(id).unwrap().spent, 25 * 60);
         assert_eq!(a.pomo.as_ref().unwrap().phase, Phase::Pause);
-        a.pomo_next();
+        a.pomo_next(true);
         assert_eq!(a.pomo.as_ref().unwrap().phase, Phase::Travail);
+        assert_eq!(a.data.get(id).unwrap().spent, 25 * 60, "passer une pause ne compte rien");
         a.data.settings.pomo_cycles = 2;
         a.pomo.as_mut().unwrap().end = Instant::now();
-        a.pomo_next();
+        a.pomo_next(false);
         assert_eq!(a.pomo.as_ref().unwrap().phase, Phase::Longue, "longue pause au 2e cycle");
         a.pomodoro_toggle();
         assert!(a.pomo.is_none());
         assert!(a.pomo_label().is_none());
+        // session libre, pause puis reprise : le temps restant ne bouge pas en pause
+        a.pomo_task = None;
+        a.pomo_play_pause();
+        assert!(a.pomo.as_ref().unwrap().running() && a.pomo.as_ref().unwrap().task.is_none());
+        a.pomo_play_pause();
+        let left = a.pomo.as_ref().unwrap().left();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(a.pomo.as_ref().unwrap().left(), left);
+        assert!(a.pomo_label().unwrap().contains("en pause"));
+        a.pomo.as_mut().unwrap().paused = Some(Duration::from_secs(20 * 60));
+        a.pomo_stop();
+        assert_eq!(a.data.free_spent, 5 * 60, "5 min de travail en session libre");
+        assert_eq!(a.data.get(id).unwrap().spent, 50 * 60);
     }
 
     #[test]
@@ -2141,7 +2357,8 @@ mod tests {
         a.sel = Some(id);
         let ctx = egui::Context::default();
         let input = || egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0))), ..Default::default() };
-        for v in [View::MyDay, View::Planned, View::Important, View::List(DEFAULT_LIST), View::Search] {
+        a.pomo_start(Some(id));
+        for v in [View::MyDay, View::Planned, View::Important, View::List(DEFAULT_LIST), View::Search, View::Pomodoro] {
             a.view = v;
             a.query = "tâche 1".into();
             let _ = ctx.run_ui(input(), |ui| a.frame(ui));

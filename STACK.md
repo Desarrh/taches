@@ -58,6 +58,8 @@ Mesures (i9-9900K, release) :
 - CPU au repos : 0 ms sur 10 s ;
 - saisie naturelle : 2,7 µs par appel ; génération d'un son : 0,1 à 1,1 ms.
 
+**Pomodoro (v0.2.0)** : onglet dédié (Ctrl+0) avec le temps restant en grand dans un anneau qui se remplit (accent pour le travail, vert doux pour les pauses), phase et rang (« Travail 2/4 »), Démarrer / Pause / Reprendre (Espace), Passer, Réinitialiser. Un seul minuteur pour l'onglet, la barre de titre, la barre latérale et l'info-bulle de l'icône. Sans tâche, c'est une session libre (`free_spent`, compté à part) ; le sélecteur, ou un glisser d'une tâche sur « Pomodoro », l'attache à une tâche (`spent`). Le travail entamé est compté quand on passe ou réinitialise. L'anneau se redessine à 30 i/s seulement quand le minuteur tourne et que l'onglet est affiché ; en pause, aucun réveil.
+
 ## 7. Intégrations
 
 - `Taches.exe --ajouter "texte"` : ajoute une tâche (saisie naturelle), transmis à l'instance en cours. Marqueur `TachesCli` dans la ressource de version, pour le Lanceur.

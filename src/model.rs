@@ -99,11 +99,13 @@ pub struct Data {
     pub settings: Settings,
     /// dernier jour où les suggestions du matin ont été proposées
     pub suggested_on: Option<NaiveDate>,
+    /// secondes de pomodoro en session libre (sans tâche)
+    pub free_spent: u64,
 }
 
 impl Default for Data {
     fn default() -> Self {
-        Data { version: 1, next_id: 2, lists: vec![List { id: DEFAULT_LIST, name: "Tâches".into(), icon: "maison".into() }], tasks: Vec::new(), settings: Settings::default(), suggested_on: None }
+        Data { version: 1, next_id: 2, lists: vec![List { id: DEFAULT_LIST, name: "Tâches".into(), icon: "maison".into() }], tasks: Vec::new(), settings: Settings::default(), suggested_on: None, free_spent: 0 }
     }
 }
 
