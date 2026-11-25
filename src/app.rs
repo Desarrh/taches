@@ -478,30 +478,26 @@ impl App {
                 }
             }
         }
+        // `--cocher <id>` (Lanceur) : coche ou +1, avec le ding normal
+        if let Some(id) = args.iter().position(|a| a == "--cocher").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok()) {
+            if self.data.get(id).is_some_and(|t| !t.is_done()) {
+                self.apply(Act::Toggle(id));
+            }
+        }
     }
 
     // ------------------------------------------------------------------ actions
 
     fn add_parsed(&mut self, text: &str, view: View) -> Option<u64> {
         let n = now();
-        let p = nlp::parse(text, n);
-        if p.title.trim().is_empty() {
-            return None;
-        }
-        let list = match (&p.list, view) {
-            (Some(name), _) => self.data.list_by_name(name),
-            (None, View::List(id)) if self.data.list(id).is_some() => id,
+        let default = match view {
+            View::List(id) => id,
             _ => DEFAULT_LIST,
         };
-        let id = self.data.add_task(list, &p.title, n);
+        let id = self.data.add_text(text, default, n)?;
         let today = self.today;
         if let Some(t) = self.data.get_mut(id) {
-            t.due = p.due;
-            t.remind = p.remind;
-            t.important = p.important || view == View::Important;
-            if let Some(k) = p.target {
-                t.target = k;
-            }
+            t.important |= view == View::Important;
             if view == View::MyDay {
                 t.my_day = Some(today);
             }

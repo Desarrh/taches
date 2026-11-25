@@ -203,6 +203,28 @@ impl Data {
         id
     }
 
+    /// Ajout depuis une saisie naturelle (fenêtre et ligne de commande). None si titre vide.
+    pub fn add_text(&mut self, text: &str, default_list: u64, now: NaiveDateTime) -> Option<u64> {
+        let p = crate::nlp::parse(text, now);
+        if p.title.trim().is_empty() {
+            return None;
+        }
+        let list = match &p.list {
+            Some(name) => self.list_by_name(name),
+            None if self.list(default_list).is_some() => default_list,
+            None => DEFAULT_LIST,
+        };
+        let id = self.add_task(list, &p.title, now);
+        let t = self.get_mut(id)?;
+        t.due = p.due;
+        t.remind = p.remind;
+        t.important = p.important;
+        if let Some(k) = p.target {
+            t.target = k;
+        }
+        Some(id)
+    }
+
     /// Coche ou décoche (ou fait avancer un compteur). Renvoie le son à jouer.
     pub fn toggle(&mut self, id: u64, now: NaiveDateTime) -> Option<Sound> {
         let t = self.get_mut(id)?;

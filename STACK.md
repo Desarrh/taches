@@ -62,7 +62,11 @@ Mesures (i9-9900K, release) :
 
 ## 7. Intégrations
 
-- `Taches.exe --ajouter "texte"` : ajoute une tâche (saisie naturelle), transmis à l'instance en cours. Marqueur `TachesCli` dans la ressource de version, pour le Lanceur.
+- **Commandes sans fenêtre** (`src/cli.rs`, marqueur `TachesCli` = `ajouter comprendre lister cocher`), pour le Lanceur ; aucune n'ouvre ni ne ramène de fenêtre :
+  - `--comprendre "<texte>" --json` → `{"v":1,"titre","liste","echeance","important","compteur"}`, parseur seul (~15 ms processus compris) ;
+  - `--lister [ma-journee|tout] --json [--chercher "<texte>"] [--max 20]` → `{"v":1,"taches":[{"id","titre","liste","echeance","important","compteur":"3/8"|null}]}`, tâches non terminées, Ma journée puis importantes d'abord, lecture seule du fichier ;
+  - `--ajouter "<texte>"` et `--cocher <id>` (coche ou +1, avec le ding) : transmis à l'instance qui tourne, sinon écrits directement ; code 0, sinon 2 (titre vide, id inconnu ou déjà terminée).
+  - `echeance` : `"AAAA-MM-JJ HH:MM"` s'il y a une heure (rappel le jour de l'échéance), `"AAAA-MM-JJ"` pour une date seule, sinon `null`. `--lister` lit le fichier : une modification faite dans la fenêtre y arrive en 0,4 à 3 s.
 - `--demarrage` : démarrage caché dans la zone de notification (valeur `Run` écrite par l'exe).
 
 ## 8. Limites connues

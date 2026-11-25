@@ -5,7 +5,7 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico")
             .set("FileDescription", "Tâches")
-            .set("TachesCli", "ajouter")
+            .set("TachesCli", "ajouter comprendre lister cocher")
             .set("ProductName", "Tâches")
             .set("InternalName", "taches")
             .set("OriginalFilename", "Taches.exe")

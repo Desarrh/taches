@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cli;
 mod model;
 mod nlp;
 mod sound;
@@ -241,7 +242,7 @@ impl ApplicationHandler<UserEvent> for Runner {
                 if let Some(a) = self.app.as_mut() {
                     a.on_args(&args);
                 }
-                if !args.iter().any(|x| x == "--demarrage" || x == "--ajouter") {
+                if !args.iter().any(|x| x == "--demarrage" || x == "--ajouter" || x == "--cocher") {
                     self.show();
                 } else {
                     self.redraw();
@@ -295,6 +296,13 @@ fn main() {
     socle::crash::install("Taches", env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let test = socle::testmode::enabled();
+    if test {
+        sound::MUTE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // commandes sans fenêtre (Lanceur) : jamais d'interface ici
+    if let Some(code) = cli::run(&args, &data_path()) {
+        std::process::exit(code);
+    }
     let start_hidden = args.iter().any(|a| a == "--demarrage");
     let mut instance = None;
     if test {
